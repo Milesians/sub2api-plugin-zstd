@@ -10,3 +10,8 @@ jobs:
    - run: go mod download
    - run: go test ./...
    - run: ./build.sh
+
+   - uses: actions/upload-artifact@v4
+     with:
+      name: sub2api-plugin-zstd
+      path: dist/sub2api-plugin-zstd.s2plugin
