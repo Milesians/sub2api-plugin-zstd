@@ -1,17 +1,40 @@
-name: build
-on: [push, pull_request]
-jobs:
- build:
-  runs-on: ubuntu-latest
-  steps:
-   - uses: actions/checkout@v4
-   - uses: actions/setup-go@v5
-     with: {go-version: '1.25'}
-   - run: go mod download
-   - run: go test ./...
-   - run: ./build.sh
+name: build-plugin
 
-   - uses: actions/upload-artifact@v4
-     with:
-      name: sub2api-plugin-zstd
-      path: dist/sub2api-plugin-zstd.s2plugin
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Configure signing key
+        env:
+          SIGNING_KEY: ${{ secrets.PLUGIN_SIGNING_KEY }}
+        run: |
+          if [ -n "$SIGNING_KEY" ]; then
+            printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/plugin-signing-key.pem"
+          fi
+      - run: go test ./...
+      - name: Build installable plugin package
+        env:
+          PLUGIN_VERSION: 0.2.${{ github.run_number }}
+          PLUGIN_SIGNING_KEY_FILE: ${{ runner.temp }}/plugin-signing-key.pem
+          PLUGIN_SIGNING_KEY_ID: ${{ vars.PLUGIN_SIGNING_KEY_ID || 'milesians' }}
+        run: ./build.sh
+      - name: Verify package structure
+        run: python3 tools/verify_package.py dist/sub2api-plugin-zstd.s2plugin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sub2api-plugin-zstd-${{ github.sha }}
+          path: dist/sub2api-plugin-zstd.s2plugin
+          if-no-files-found: error

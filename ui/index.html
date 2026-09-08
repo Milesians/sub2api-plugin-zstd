@@ -1,1 +1,47 @@
-<!doctype html><meta charset="utf-8"><title>OpenAI OAuth zstd</title><style>body{font:14px system-ui;padding:16px;color:#222}label{display:block;margin:12px 0}button{padding:7px 14px}</style><h3>OpenAI OAuth zstd</h3><label><input id="enabled" type="checkbox"> 启用压缩</label><label>压缩级别 <input id="level" type="number" min="1" max="22" value="3"></label><label><input id="fallback" type="checkbox" checked> 不兼容时允许明文回退</label><button id="save">保存</button><script>let cfg={enabled:true,level:3,fallback_uncompressed:true};const send=(type,p={})=>parent.postMessage({source:'sub2api.plugin',type,request_id:crypto.randomUUID(),...p},'*');addEventListener('message',e=>{if(e.data?.type==='config.loaded'){cfg=e.data.config||cfg;enabled.checked=cfg.enabled;level.value=cfg.level;fallback.checked=cfg.fallback_uncompressed}});send('sub2api.plugin.ready');send('config.load');save.onclick=()=>send('config.save',{config:{enabled:enabled.checked,level:+level.value,fallback_uncompressed:fallback.checked}})</script>
+<!doctype html>
+<meta charset="utf-8">
+<title>OpenAI OAuth zstd</title>
+<style>body{font:14px system-ui,sans-serif;padding:16px;color:#222}label{display:block;margin:12px 0}button{padding:7px 14px}#status{min-height:1.4em;color:#555}</style>
+<h3>OpenAI OAuth zstd</h3>
+<p>压缩只应用于 OpenAI OAuth Codex Responses 上游请求。</p>
+<label><input id="enabled" type="checkbox"> 启用压缩</label>
+<label>压缩级别 <input id="level" type="number" min="1" max="22" value="3"></label>
+<label><input id="fallback" type="checkbox" checked> 压缩初始化失败时发送明文</label>
+<button id="save">保存</button> <button id="test">测试</button>
+<div id="status" role="status"></div>
+<script>
+(() => {
+  const state = {enabled:true, level:3, fallback_uncompressed:true};
+  const bridgeToken = new URLSearchParams(location.hash.slice(1)).get('bridge_token') || '';
+  const pending = new Map();
+  const status = document.getElementById('status');
+  const send = (type, payload = {}) => {
+    const request_id = crypto.randomUUID();
+    parent.postMessage({source:'sub2api-plugin-ui', bridge_token:bridgeToken, type, request_id, ...payload}, '*');
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { pending.delete(request_id); reject(new Error('宿主响应超时')); }, 30000);
+      pending.set(request_id, {resolve, reject, timer});
+    });
+  };
+  addEventListener('message', event => {
+    // The parent origin is deployment-specific; source and the per-session token
+    // are the trust checks required by the UI Bridge contract.
+    if (event.source !== parent) return;
+    const message = event.data || {};
+    if (message.source !== 'sub2api-plugin-host' || message.bridge_token !== bridgeToken) return;
+    const item = pending.get(message.request_id);
+    if (!item) return;
+    clearTimeout(item.timer); pending.delete(message.request_id);
+    if (message.ok === false) item.reject(new Error(message.error || '操作失败')); else item.resolve(message);
+  });
+  const apply = config => { Object.assign(state, config || {}); enabled.checked=!!state.enabled; level.value=state.level; fallback.checked=!!state.fallback_uncompressed; };
+  const read = () => ({enabled:enabled.checked, level:Number(level.value), fallback_uncompressed:fallback.checked});
+  const run = async (type, payload) => { try { const result = await send(type, payload); if (result.config) apply(result.config); if (result.result) status.textContent = result.result.message || '测试完成'; return result; } catch (error) { status.textContent = error.message; throw error; } };
+  enabled.checked=true; fallback.checked=true;
+  parent.postMessage({source:'sub2api-plugin-ui', bridge_token:bridgeToken, type:'sub2api.plugin.ready'}, '*');
+  run('config.load').catch(() => {});
+  save.onclick = () => run('config.save', {config:read()}).then(() => { status.textContent='已保存'; });
+  test.onclick = () => run('config.test');
+  addEventListener('beforeunload', () => pending.forEach(item => { clearTimeout(item.timer); item.reject(new Error('页面已关闭')); }));
+})();
+</script>
