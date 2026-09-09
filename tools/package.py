@@ -27,7 +27,7 @@ def main():
     manifest_bytes = (json.dumps(manifest, separators=(',', ':'), ensure_ascii=False) + '\n').encode()
     signature = None
     env_key = Path(os.environ['PLUGIN_SIGNING_KEY_FILE']) if os.environ.get('PLUGIN_SIGNING_KEY_FILE') else None
-    signing_key = args.signing_key or (env_key if env_key and env_key.exists() else None)
+    signing_key = args.signing_key or env_key
     if signing_key:
         if not args.key_id:
             raise SystemExit('--key-id or PLUGIN_SIGNING_KEY_ID is required when signing')
@@ -36,7 +36,6 @@ def main():
             manifest_file.flush()
             subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(signing_key), '-in', manifest_file.name, '-out', signed.name], check=True)
             signature = (json.dumps({'algorithm': 'ed25519', 'key_id': args.key_id, 'signature': base64.b64encode(Path(signed.name).read_bytes()).decode()}, separators=(',', ':')) + '\n').encode()
-            (root / 'signature.json').write_bytes(signature)
     out.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr('manifest.json', manifest_bytes)

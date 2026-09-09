@@ -88,6 +88,12 @@ func (s *server) ApplyConfig(_ context.Context, req *pluginv1.ApplyConfigRequest
 	s.mu.Lock()
 	s.cfg = c
 	s.mu.Unlock()
+	s.clientsMu.Lock()
+	for _, client := range s.clients {
+		client.CloseIdleConnections()
+	}
+	s.clients = make(map[string]*http.Client)
+	s.clientsMu.Unlock()
 	return &pluginv1.ApplyConfigResponse{Applied: true, Message: "applied"}, nil
 }
 
@@ -124,14 +130,26 @@ func (s *server) httpClient(proxyRaw string) (*http.Client, error) {
 		return client, nil
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Bound the wait for headers without cutting off long-lived SSE bodies.
+	transport.ResponseHeaderTimeout = 2 * time.Minute
+	transport.DisableCompression = true
 	if proxyRaw != "" {
 		proxy, err := url.Parse(proxyRaw)
-		if err != nil || (proxy.Scheme != "http" && proxy.Scheme != "https") {
+		if err != nil || (proxy.Scheme != "http" && proxy.Scheme != "https") || proxy.Hostname() == "" {
 			return nil, errors.New("proxy_url must be an http or https URL")
 		}
 		transport.Proxy = http.ProxyURL(proxy)
 	}
-	client := &http.Client{Transport: transport}
+	// Bound cache growth even when accounts frequently change proxies.
+	if len(s.clients) >= 64 {
+		for key, old := range s.clients {
+			old.CloseIdleConnections()
+			delete(s.clients, key)
+		}
+	}
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
 	s.clients[proxyRaw] = client
 	return client, nil
 }
@@ -159,6 +177,10 @@ func (s *server) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 		return nil
 	}
 	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
 	var encoder *zstd.Encoder
 	compress := eligibleRequest(c, start)
 	if compress {
@@ -171,7 +193,7 @@ func (s *server) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 			compress = false
 		}
 	}
-	request, err := http.NewRequestWithContext(stream.Context(), start.Method, start.Url, reader)
+	request, err := http.NewRequestWithContext(ctx, start.Method, start.Url, reader)
 	if err != nil {
 		_ = reader.Close()
 		_ = writer.Close()
@@ -185,6 +207,7 @@ func (s *server) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 			}
 		}
 	}
+	request.Host = start.Host
 	if compress {
 		request.ContentLength = -1
 		request.Header.Del("Content-Length")
@@ -222,12 +245,20 @@ func (s *server) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 		}
 		switch value := frame.Frame.(type) {
 		case *pluginv1.ForwardRequest_BodyChunk:
+			if !start.HasBody && len(value.BodyChunk) != 0 {
+				bodyErr = errors.New("body_chunk supplied when has_body is false")
+				break
+			}
 			if encoder != nil {
 				_, bodyErr = encoder.Write(value.BodyChunk)
 			} else {
 				_, bodyErr = writer.Write(value.BodyChunk)
 			}
 		case *pluginv1.ForwardRequest_BodyEnd:
+			if !value.BodyEnd {
+				bodyErr = errors.New("body_end must be true")
+				break
+			}
 			if encoder != nil {
 				bodyErr = encoder.Close()
 			}
@@ -235,6 +266,8 @@ func (s *server) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 				bodyErr = writer.Close()
 			}
 			goto bodyDone
+		default:
+			bodyErr = errors.New("expected body_chunk or body_end")
 		}
 		if bodyErr != nil {
 			break
@@ -244,6 +277,12 @@ func (s *server) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 	_ = writer.Close()
 bodyDone:
 	if bodyErr != nil {
+		cancel()
+		_ = reader.CloseWithError(bodyErr)
+		_ = writer.CloseWithError(bodyErr)
+		if encoder != nil {
+			_ = encoder.Close()
+		}
 		go func() {
 			completed := <-result
 			if completed.response != nil {
