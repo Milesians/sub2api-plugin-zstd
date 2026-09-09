@@ -45,6 +45,11 @@ jobs:
           printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/plugin-signing-key.pem"
           openssl pkey -in "$RUNNER_TEMP/plugin-signing-key.pem" -pubout \
             -out dist/plugin-signing-key-public.pem
+          {
+            echo 'key_id: milesians'
+            echo 'public_key: |'
+            sed 's/^/  /' dist/plugin-signing-key-public.pem
+          } > dist/plugin-publisher.txt
       - name: Verify package structure
         run: python3 tools/verify_package.py dist/sub2api-plugin-zstd.s2plugin
       - uses: actions/upload-artifact@v4
@@ -71,9 +76,9 @@ jobs:
           RELEASE_TAG: v0.2.${{ github.run_number }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/sub2api-plugin-zstd.s2plugin dist/plugin-signing-key-public.pem --clobber
+            gh release upload "$RELEASE_TAG" dist/sub2api-plugin-zstd.s2plugin dist/plugin-signing-key-public.pem dist/plugin-publisher.txt --clobber
           else
-            gh release create "$RELEASE_TAG" dist/sub2api-plugin-zstd.s2plugin dist/plugin-signing-key-public.pem \
+            gh release create "$RELEASE_TAG" dist/sub2api-plugin-zstd.s2plugin dist/plugin-signing-key-public.pem dist/plugin-publisher.txt \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_TAG" \
               --generate-notes
