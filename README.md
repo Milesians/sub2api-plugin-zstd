@@ -27,4 +27,4 @@ PLUGIN_VERSION=0.2.0 ./build.sh dist
 
 推送到 `main` 或创建 Pull Request 都会运行单元测试和多平台构建，并上传以提交 SHA 命名的插件包 Artifact。`main` 的推送在测试、构建和包校验成功后自动发布 `v0.2.<run_number>` GitHub Release，附带可下载的 `sub2api-plugin-zstd.s2plugin`；标签指向该次构建的提交，插件版本为 `0.2.<run_number>`。重新运行同一次工作流会更新该 Release 的附件。Pull Request 不发布 Release。
 
-发布任务通过内置 `GITHUB_TOKEN` 的 `contents: write` 权限创建标签和 Release，无需额外 PAT。缺少签名 Secret 时仍发布未签名开发包，生产安装前请配置签名密钥。
+发布任务通过内置 `GITHUB_TOKEN` 的 `contents: write` 权限创建标签和 Release，无需额外 PAT。`main` 推送若未配置 `PLUGIN_SIGNING_KEY` 会在构建阶段失败，避免发布生产环境不可安装的未签名包；Pull Request 仍可构建未签名开发包。

@@ -26,6 +26,11 @@ jobs:
             printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/plugin-signing-key.pem"
             echo "PLUGIN_SIGNING_KEY_FILE=$RUNNER_TEMP/plugin-signing-key.pem" >> "$GITHUB_ENV"
           fi
+      - name: Require signing key for production release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          SIGNING_KEY: ${{ secrets.PLUGIN_SIGNING_KEY }}
+        run: test -n "$SIGNING_KEY"
       - run: go test -race ./...
       - name: Build installable plugin package
         env:
