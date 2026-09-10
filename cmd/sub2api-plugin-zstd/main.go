@@ -105,10 +105,32 @@ func (s *server) ApplyConfig(_ context.Context, req *pluginv1.ApplyConfigRequest
 }
 
 func (s *server) TestConfig(_ context.Context, req *pluginv1.TestConfigRequest) (*pluginv1.TestConfigResponse, error) {
-	if _, _, err := normalize(req.GetConfigJson()); err != nil {
+	started := time.Now()
+	c, _, err := normalize(req.GetConfigJson())
+	if err != nil {
 		return &pluginv1.TestConfigResponse{Success: false, Message: err.Error()}, nil
 	}
-	return &pluginv1.TestConfigResponse{Success: true, Message: "zstd transport ready"}, nil
+	if !c.Enabled {
+		return &pluginv1.TestConfigResponse{Success: false, Message: "压缩未启用，请启用后再自检。"}, nil
+	}
+	body, _ := json.Marshal(map[string]any{"model": "self-test", "input": strings.Repeat("这是一段用于验证 zstd 请求压缩的数据。", 128), "stream": true})
+	compressed, err := compressRequestBody(body, c.Level)
+	if err != nil {
+		return &pluginv1.TestConfigResponse{Success: false, Message: "压缩失败：" + err.Error()}, nil
+	}
+	decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+	if err != nil {
+		return &pluginv1.TestConfigResponse{Success: false, Message: "解压初始化失败：" + err.Error()}, nil
+	}
+	defer decoder.Close()
+	decoded, err := decoder.DecodeAll(compressed, nil)
+	if err != nil {
+		return &pluginv1.TestConfigResponse{Success: false, Message: "解压失败：" + err.Error()}, nil
+	}
+	if !bytes.Equal(body, decoded) {
+		return &pluginv1.TestConfigResponse{Success: false, Message: "解压结果与原始数据不一致"}, nil
+	}
+	return &pluginv1.TestConfigResponse{Success: true, LatencyMs: time.Since(started).Milliseconds(), Message: fmt.Sprintf("本地压缩自检通过：级别 %d，样例 %d → %d 字节，解压一致。未测试 OAuth 账号、代理或上游连通性。", c.Level, len(body), len(compressed))}, nil
 }
 
 func eligibleRequest(c config, start *pluginv1.ForwardRequestStart) bool {

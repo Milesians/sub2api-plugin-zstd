@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +32,92 @@ func TestNormalizeConfig(t *testing.T) {
 	}
 	if _, _, err := normalize([]byte(`{"level":3} {}`)); err == nil {
 		t.Fatal("trailing JSON accepted")
+	}
+}
+
+func TestConfigCompressionSelfTest(t *testing.T) {
+	s := &server{cfg: defaultConfig()}
+	for _, tc := range []struct {
+		name, config, message string
+		success               bool
+	}{
+		{"default", `{}`, "解压一致", true},
+		{"custom level", `{"level":1}`, "级别 1", true},
+		{"disabled", `{"enabled":false}`, "压缩未启用", false},
+		{"invalid", `{"level":23}`, "level must be", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := s.TestConfig(context.Background(), &pluginv1.TestConfigRequest{ConfigJson: []byte(tc.config)})
+			if err != nil || result.Success != tc.success || !strings.Contains(result.Message, tc.message) {
+				t.Fatalf("result=%v err=%v", result, err)
+			}
+			if s.cfg != defaultConfig() {
+				t.Fatal("self-test modified active config")
+			}
+		})
+	}
+}
+
+// Route the real Forward HTTP client to a local TLS upstream while retaining
+// the eligible chatgpt.com URL. No OAuth credentials or external network needed.
+func TestForwardCompressedHTTPRoundTrip(t *testing.T) {
+	body := []byte(strings.Repeat(`{"input":"hello world"}`, 256))
+	const responseBody = "data: {\"type\":\"response.completed\"}\n\n"
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "chatgpt.com" || r.Header.Get("Content-Encoding") != "zstd" {
+			t.Errorf("host=%q encoding=%q", r.Host, r.Header.Get("Content-Encoding"))
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(500)
+			return
+		}
+		if r.ContentLength != int64(len(raw)) || len(raw) >= len(body) {
+			t.Errorf("content_length=%d compressed=%d original=%d", r.ContentLength, len(raw), len(body))
+		}
+		decoder, err := zstd.NewReader(nil)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(500)
+			return
+		}
+		defer decoder.Close()
+		decoded, err := decoder.DecodeAll(raw, nil)
+		if err != nil || !bytes.Equal(decoded, body) {
+			t.Errorf("decoded body mismatch: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	defer upstream.Close()
+	client := upstream.Client()
+	transport := client.Transport.(*http.Transport)
+	transport.Proxy = nil
+	transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	transport.TLSClientConfig.ServerName = "example.com" // httptest certificate identity
+	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, upstream.Listener.Addr().String())
+	}
+	s := &server{cfg: defaultConfig(), clients: map[string]*http.Client{"": client}}
+	stream := &testForwardStream{ctx: context.Background(), requests: []*pluginv1.ForwardRequest{
+		{Frame: &pluginv1.ForwardRequest_Start{Start: &pluginv1.ForwardRequestStart{Method: http.MethodPost, Url: "https://chatgpt.com/backend-api/codex/responses", Platform: "openai", AccountType: "oauth", ContentLength: int64(len(body)), HasBody: true}}},
+		{Frame: &pluginv1.ForwardRequest_BodyChunk{BodyChunk: body[:100]}},
+		{Frame: &pluginv1.ForwardRequest_BodyChunk{BodyChunk: body[100:]}},
+		{Frame: &pluginv1.ForwardRequest_BodyEnd{BodyEnd: true}},
+	}}
+	if err := s.Forward(stream); err != nil {
+		t.Fatal(err)
+	}
+	var received bytes.Buffer
+	for _, frame := range stream.responses {
+		if frame.GetError() != nil {
+			t.Fatal(frame.GetError())
+		}
+		received.Write(frame.GetBodyChunk())
+	}
+	if len(stream.responses) < 3 || stream.responses[0].GetStart().GetStatusCode() != 200 || stream.responses[len(stream.responses)-1].GetEnd() == nil || received.String() != responseBody {
+		t.Fatalf("incomplete response: %v", stream.responses)
 	}
 }
 

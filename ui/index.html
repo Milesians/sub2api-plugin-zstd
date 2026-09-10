@@ -7,7 +7,8 @@
 <label><input id="enabled" type="checkbox"> 启用压缩</label>
 <label>压缩级别 <input id="level" type="number" min="1" max="22" value="3"></label>
 <label><input id="fallback" type="checkbox" checked> 压缩初始化失败时发送明文</label>
-<button id="save">保存</button> <button id="test">测试</button>
+<button id="save">保存</button> <button id="test">压缩自检</button>
+<p>自检验证当前配置的压缩与解压；真实请求请保存配置后，通过宿主使用 OpenAI OAuth 账号调用 Responses。</p>
 <div id="status" role="status"></div>
 <script>
 (() => {
@@ -15,8 +16,12 @@
   const bridgeToken = new URLSearchParams(location.hash.slice(1)).get('bridge_token') || '';
   const pending = new Map();
   const status = document.getElementById('status');
+  let requestSequence = 0;
   const send = (type, payload = {}) => {
-    const request_id = crypto.randomUUID();
+    // HTTP deployments may lack randomUUID; IDs only correlate bridge replies.
+    const request_id = typeof globalThis.crypto?.randomUUID === 'function'
+      ? globalThis.crypto.randomUUID()
+      : `request-${Date.now()}-${++requestSequence}`;
     parent.postMessage({source:'sub2api-plugin-ui', bridge_token:bridgeToken, type, request_id, ...payload}, '*');
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { pending.delete(request_id); reject(new Error('宿主响应超时')); }, 30000);
@@ -36,12 +41,12 @@
   });
   const apply = config => { Object.assign(state, config || {}); enabled.checked=!!state.enabled; level.value=state.level; fallback.checked=!!state.fallback_uncompressed; };
   const read = () => ({enabled:enabled.checked, level:Number(level.value), fallback_uncompressed:fallback.checked});
-  const run = async (type, payload) => { try { const result = await send(type, payload); if (result.config) apply(result.config); if (result.result) status.textContent = result.result.message || '测试完成'; return result; } catch (error) { status.textContent = error.message; throw error; } };
+  const run = async (type, payload) => { try { const result = await send(type, payload); if (result.config) apply(result.config); if (result.result) { status.textContent = result.result.message || '测试完成'; if (result.result.success === false) throw new Error(result.result.message || '自检失败'); } return result; } catch (error) { status.textContent = error.message; throw error; } };
   enabled.checked=true; fallback.checked=true;
   parent.postMessage({source:'sub2api-plugin-ui', bridge_token:bridgeToken, type:'sub2api.plugin.ready'}, '*');
   run('config.load').catch(() => {});
-  save.onclick = () => run('config.save', {config:read()}).then(() => { status.textContent='已保存'; });
-  test.onclick = () => run('config.test');
+  save.onclick = () => run('config.save', {config:read()}).then(() => { status.textContent='已保存'; }).catch(() => {});
+  test.onclick = async () => { test.disabled = true; status.textContent = '正在自检…'; try { await run('config.test', {config:read()}); } catch {} finally { test.disabled = false; } };
   addEventListener('beforeunload', () => pending.forEach(item => { clearTimeout(item.timer); item.reject(new Error('页面已关闭')); }));
 })();
 </script>
