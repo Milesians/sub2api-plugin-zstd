@@ -23,6 +23,8 @@ PLUGIN_VERSION=0.2.0 ./build.sh dist
 
 `signature.json` 签名对象是清单文件的原始字节。私钥不应提交到仓库；GitHub Actions 使用 Secret `PLUGIN_SIGNING_KEY` 和 Repository Variable `PLUGIN_SIGNING_KEY_ID`（缺少 Secret 时生成开发包）。
 
+生产部署者需要将 Release 附件 `plugin-publisher.txt` 中的配置加入 Sub2API 的 `plugins.trusted_publishers`。其中的公钥是 Base64 编码的 Ed25519 原始 32 字节公钥，不是 PEM 或 DER 封装格式。
+
 ## GitHub Actions
 
 推送到 `main` 或创建 Pull Request 都会运行单元测试和多平台构建，并上传以提交 SHA 命名的插件包 Artifact。`main` 的推送在测试、构建和包校验成功后自动发布 `v0.2.<run_number>` GitHub Release，附带可下载的 `sub2api-plugin-zstd.s2plugin`；标签指向该次构建的提交，插件版本为 `0.2.<run_number>`。重新运行同一次工作流会更新该 Release 的附件。Pull Request 不发布 Release。
