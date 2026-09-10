@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/Milesians/sub2api-plugin-zstd/internal/pluginv1"
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/net/proxy"
 )
 
 const pluginID = "milesians.openai.oauth.zstd"
@@ -134,11 +136,33 @@ func (s *server) httpClient(proxyRaw string) (*http.Client, error) {
 	transport.ResponseHeaderTimeout = 2 * time.Minute
 	transport.DisableCompression = true
 	if proxyRaw != "" {
-		proxy, err := url.Parse(proxyRaw)
-		if err != nil || (proxy.Scheme != "http" && proxy.Scheme != "https") || proxy.Hostname() == "" {
-			return nil, errors.New("proxy_url must be an http or https URL")
+		proxyURL, err := url.Parse(proxyRaw)
+		if err != nil || proxyURL.Hostname() == "" {
+			return nil, errors.New("invalid proxy URL")
 		}
-		transport.Proxy = http.ProxyURL(proxy)
+		switch strings.ToLower(proxyURL.Scheme) {
+		case "http", "https":
+			transport.Proxy = http.ProxyURL(proxyURL)
+		case "socks5", "socks5h":
+			var auth *proxy.Auth
+			if proxyURL.User != nil {
+				if password, ok := proxyURL.User.Password(); ok {
+					auth = &proxy.Auth{User: proxyURL.User.Username(), Password: password}
+				} else {
+					auth = &proxy.Auth{User: proxyURL.User.Username()}
+				}
+			}
+			dialer, dialErr := proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
+			if dialErr != nil {
+				return nil, fmt.Errorf("invalid SOCKS5 proxy: %w", dialErr)
+			}
+			transport.Proxy = nil
+			transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				return dialer.Dial(network, address)
+			}
+		default:
+			return nil, errors.New("proxy_url must use http, https, socks5, or socks5h")
+		}
 	}
 	// Bound cache growth even when accounts frequently change proxies.
 	if len(s.clients) >= 64 {
