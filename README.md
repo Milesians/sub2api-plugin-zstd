@@ -2,7 +2,7 @@
 
 这是一个 Sub2API `openai.oauth.outbound_transport.v1` 插件。它只处理 `platform=openai`、`account_type=oauth` 的 POST 请求，并且只压缩 `chatgpt.com`（含子域名）下 `/backend-api/codex/*/responses` 的请求体。插件不处理 OAuth 登录、Token 刷新、API Key 账号、其他 Provider、SSE 解析或计费。
 
-插件作为独立进程运行，通过 Sub2API v1 gRPC 协议接收 `start`、多个 `body_chunk` 和 `body_end`，使用管道流式压缩后连接上游，再把原始响应头和响应体流式返回。代理 URL 支持 HTTP/HTTPS；请求已经交给 HTTP client 后发生的错误都标记为 `request_sent=true`，宿主据此不会自动重放到其他账号。
+插件作为独立进程运行，通过 Sub2API v1 gRPC 协议接收 `start`、多个 `body_chunk` 和 `body_end`。符合条件的请求先完整接收并使用 zstd level 3 压缩，再以准确的 `Content-Length` 连接上游；响应头和响应体仍然流式返回。代理 URL 支持 HTTP/HTTPS、SOCKS5；请求已经交给 HTTP client 后发生的错误都标记为 `request_sent=true`，宿主据此不会自动重放到其他账号。
 
 ## 本地构建
 

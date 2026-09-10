@@ -35,15 +35,23 @@ func TestNormalizeConfig(t *testing.T) {
 }
 
 type captureTransport struct {
-	body     []byte
-	encoding string
+	body          []byte
+	encoding      string
+	contentLength int64
+	wireLength    int
 }
 
 func (t *captureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.encoding = req.Header.Get("Content-Encoding")
+	t.contentLength = req.ContentLength
 	var err error
 	if t.encoding == "zstd" {
-		decoder, e := zstd.NewReader(req.Body)
+		raw, e := io.ReadAll(req.Body)
+		if e != nil {
+			return nil, e
+		}
+		t.wireLength = len(raw)
+		decoder, e := zstd.NewReader(bytes.NewReader(raw))
 		if e != nil {
 			return nil, e
 		}
@@ -70,8 +78,27 @@ func TestForwardCompressesEligibleRequest(t *testing.T) {
 	if err := s.Forward(stream); err != nil {
 		t.Fatal(err)
 	}
-	if transport.encoding != "zstd" || !bytes.Equal(transport.body, []byte("hello world")) {
-		t.Fatalf("encoding=%q body=%q", transport.encoding, transport.body)
+	if transport.encoding != "zstd" || !bytes.Equal(transport.body, []byte("hello world")) || transport.contentLength != int64(transport.wireLength) {
+		t.Fatalf("encoding=%q content_length=%d wire_length=%d body=%q", transport.encoding, transport.contentLength, transport.wireLength, transport.body)
+	}
+}
+
+func TestCompressRequestBodyUsesCodexDefaults(t *testing.T) {
+	compressed, err := compressRequestBody([]byte("hello world"), codexZstdLevel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder, err := zstd.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decompressed, err := io.ReadAll(decoder)
+	decoder.Close()
+	if err != nil || !bytes.Equal(decompressed, []byte("hello world")) {
+		t.Fatalf("decompressed=%q err=%v", decompressed, err)
+	}
+	if len(compressed) < 5 || !bytes.Equal(compressed[:4], []byte{0x28, 0xb5, 0x2f, 0xfd}) || compressed[4]&0x04 != 0 {
+		t.Fatalf("unexpected Codex-compatible frame header: %x", compressed)
 	}
 }
 

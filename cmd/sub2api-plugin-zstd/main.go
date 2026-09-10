@@ -21,6 +21,9 @@ import (
 
 const pluginID = "milesians.openai.oauth.zstd"
 
+// Codex CLI uses zstd::stream::encode_all(body, 3).
+const codexZstdLevel = 3
+
 // pluginVersion is overridden by build.sh so GetInfo matches manifest.json.
 var pluginVersion = "0.2.0"
 
@@ -30,7 +33,9 @@ type config struct {
 	FallbackUncompressed bool `json:"fallback_uncompressed"`
 }
 
-func defaultConfig() config { return config{Enabled: true, Level: 3, FallbackUncompressed: true} }
+func defaultConfig() config {
+	return config{Enabled: true, Level: codexZstdLevel, FallbackUncompressed: true}
+}
 
 func normalize(raw []byte) (config, []byte, error) {
 	c := defaultConfig()
@@ -49,7 +54,7 @@ func normalize(raw []byte) (config, []byte, error) {
 		}
 	}
 	if c.Level == 0 {
-		c.Level = 3
+		c.Level = codexZstdLevel
 	}
 	if c.Level < 1 || c.Level > 22 {
 		return c, nil, fmt.Errorf("level must be 1..22")
@@ -182,47 +187,68 @@ func sendForwardError(stream pluginv1.TransportPlugin_ForwardServer, code, messa
 	return stream.Send(&pluginv1.ForwardResponse{Frame: &pluginv1.ForwardResponse_Error{Error: &pluginv1.ForwardResponseError{Code: code, Message: message, RequestSent: sent}}})
 }
 
-func (s *server) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
-	first, err := stream.Recv()
-	if err != nil {
-		return err
-	}
-	start := first.GetStart()
-	if start == nil {
-		_ = sendForwardError(stream, "INVALID_REQUEST", "first frame must be start", false)
-		return nil
-	}
-	s.mu.RLock()
-	c := s.cfg
-	s.mu.RUnlock()
-	client, err := s.httpClient(start.ProxyUrl)
-	if err != nil {
-		_ = sendForwardError(stream, "INVALID_PROXY", err.Error(), false)
-		return nil
-	}
-	reader, writer := io.Pipe()
-	defer reader.Close()
-	defer writer.Close()
-	ctx, cancel := context.WithCancel(stream.Context())
-	defer cancel()
-	var encoder *zstd.Encoder
-	compress := eligibleRequest(c, start)
-	if compress {
-		encoder, err = zstd.NewWriter(writer, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(c.Level)))
-		if err != nil {
-			if !c.FallbackUncompressed {
-				_ = sendForwardError(stream, "COMPRESSION_INIT_FAILED", err.Error(), false)
-				return nil
+func receiveRequestBody(stream pluginv1.TransportPlugin_ForwardServer, start *pluginv1.ForwardRequestStart, writer io.Writer) error {
+	for {
+		frame, recvErr := stream.Recv()
+		if recvErr == io.EOF {
+			return errors.New("request ended without body_end")
+		}
+		if recvErr != nil {
+			return recvErr
+		}
+		if frame == nil {
+			return errors.New("request frame is nil")
+		}
+		switch value := frame.Frame.(type) {
+		case *pluginv1.ForwardRequest_BodyChunk:
+			if !start.HasBody && len(value.BodyChunk) != 0 {
+				return errors.New("body_chunk supplied when has_body is false")
 			}
-			compress = false
+			if _, err := writer.Write(value.BodyChunk); err != nil {
+				return err
+			}
+		case *pluginv1.ForwardRequest_BodyEnd:
+			if !value.BodyEnd {
+				return errors.New("body_end must be true")
+			}
+			return nil
+		default:
+			return errors.New("expected body_chunk or body_end")
 		}
 	}
-	request, err := http.NewRequestWithContext(ctx, start.Method, start.Url, reader)
+}
+
+func compressRequestBody(body []byte, level int) ([]byte, error) {
+	// Like Codex's libzstd stream encoder, buffer the complete compressed frame
+	// before sending it, without a dictionary, checksum, or worker threads.
+	options := []zstd.EOption{
+		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
+		zstd.WithEncoderCRC(false),
+		zstd.WithEncoderConcurrency(1),
+	}
+	if level == codexZstdLevel {
+		// libzstd's level 3 stream uses a 2 MiB window for an unknown input size.
+		options = append(options, zstd.WithWindowSize(2<<20))
+	}
+	var compressed bytes.Buffer
+	encoder, err := zstd.NewWriter(&compressed, options...)
 	if err != nil {
-		_ = reader.Close()
-		_ = writer.Close()
-		_ = sendForwardError(stream, "INVALID_REQUEST", err.Error(), false)
-		return nil
+		return nil, err
+	}
+	if _, err := encoder.Write(body); err != nil {
+		_ = encoder.Close()
+		return nil, err
+	}
+	if err := encoder.Close(); err != nil {
+		return nil, err
+	}
+	return compressed.Bytes(), nil
+}
+
+func newForwardRequest(ctx context.Context, start *pluginv1.ForwardRequestStart, body io.Reader) (*http.Request, error) {
+	request, err := http.NewRequestWithContext(ctx, start.Method, start.Url, body)
+	if err != nil {
+		return nil, err
 	}
 	for key, values := range start.Headers {
 		if values != nil {
@@ -232,89 +258,114 @@ func (s *server) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 		}
 	}
 	request.Host = start.Host
-	if compress {
-		request.ContentLength = -1
-		request.Header.Del("Content-Length")
-		request.Header.Del("Content-Encoding")
+	return request, nil
+}
+
+func (s *server) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
+	first, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	start := first.GetStart()
+	if start == nil {
+		return sendForwardError(stream, "INVALID_REQUEST", "first frame must be start", false)
+	}
+	s.mu.RLock()
+	c := s.cfg
+	s.mu.RUnlock()
+	client, err := s.httpClient(start.ProxyUrl)
+	if err != nil {
+		return sendForwardError(stream, "INVALID_PROXY", err.Error(), false)
+	}
+	if !eligibleRequest(c, start) || !start.HasBody {
+		return forwardUncompressed(stream, start, client)
+	}
+	// Codex rejects a preexisting content encoding instead of overwriting it
+	// and accidentally compressing already encoded bytes a second time.
+	for key := range start.Headers {
+		if strings.EqualFold(key, "Content-Encoding") {
+			return sendForwardError(stream, "COMPRESSION_CONFLICT", "request compression was requested but content-encoding is already set", false)
+		}
+	}
+	var requestBody bytes.Buffer
+	if err := receiveRequestBody(stream, start, &requestBody); err != nil {
+		return sendForwardError(stream, "REQUEST_BODY_ERROR", err.Error(), false)
+	}
+	if start.ContentLength >= 0 && start.ContentLength != int64(requestBody.Len()) {
+		return sendForwardError(stream, "REQUEST_BODY_ERROR", "request body length does not match content_length", false)
+	}
+	if err := stream.Context().Err(); err != nil {
+		return err
+	}
+	body, compressionErr := compressRequestBody(requestBody.Bytes(), c.Level)
+	if compressionErr != nil {
+		if !c.FallbackUncompressed {
+			return sendForwardError(stream, "COMPRESSION_FAILED", compressionErr.Error(), false)
+		}
+		body = requestBody.Bytes()
+	}
+	request, err := newForwardRequest(stream.Context(), start, bytes.NewReader(body))
+	if err != nil {
+		return sendForwardError(stream, "INVALID_REQUEST", err.Error(), false)
+	}
+	request.Header.Del("Content-Length")
+	request.ContentLength = int64(len(body))
+	if compressionErr == nil {
 		request.Header.Set("Content-Encoding", "zstd")
-		request.Header.Set("Content-Type", "application/json")
-	} else if start.ContentLength >= 0 {
+		if _, exists := request.Header["Content-Type"]; !exists {
+			request.Header.Set("Content-Type", "application/json")
+		}
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		return sendForwardError(stream, "UPSTREAM_ERROR", err.Error(), true)
+	}
+	return sendResponse(stream, response)
+}
+
+// Requests outside compression's scope retain streaming passthrough and their
+// original content length; buffering is only needed for zstd's encoded length.
+func forwardUncompressed(stream pluginv1.TransportPlugin_ForwardServer, start *pluginv1.ForwardRequestStart, client *http.Client) error {
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	request, err := newForwardRequest(ctx, start, reader)
+	if err != nil {
+		return sendForwardError(stream, "INVALID_REQUEST", err.Error(), false)
+	}
+	if !start.HasBody {
+		request.Body = http.NoBody
+	}
+	if start.ContentLength >= 0 {
 		request.ContentLength = start.ContentLength
 	}
-	result := make(chan struct {
+	type upstreamResult struct {
 		response *http.Response
 		err      error
-	}, 1)
-	go func() {
-		response, requestErr := client.Do(request)
-		result <- struct {
-			response *http.Response
-			err      error
-		}{response, requestErr}
-	}()
-	var bodyErr error
-	for {
-		frame, recvErr := stream.Recv()
-		if recvErr == io.EOF {
-			bodyErr = errors.New("request ended without body_end")
-			break
-		}
-		if recvErr != nil {
-			bodyErr = recvErr
-			break
-		}
-		if frame == nil {
-			bodyErr = errors.New("request frame is nil")
-			break
-		}
-		switch value := frame.Frame.(type) {
-		case *pluginv1.ForwardRequest_BodyChunk:
-			if !start.HasBody && len(value.BodyChunk) != 0 {
-				bodyErr = errors.New("body_chunk supplied when has_body is false")
-				break
-			}
-			if encoder != nil {
-				_, bodyErr = encoder.Write(value.BodyChunk)
-			} else {
-				_, bodyErr = writer.Write(value.BodyChunk)
-			}
-		case *pluginv1.ForwardRequest_BodyEnd:
-			if !value.BodyEnd {
-				bodyErr = errors.New("body_end must be true")
-				break
-			}
-			if encoder != nil {
-				bodyErr = encoder.Close()
-			}
-			if bodyErr == nil {
-				bodyErr = writer.Close()
-			}
-			goto bodyDone
-		default:
-			bodyErr = errors.New("expected body_chunk or body_end")
-		}
-		if bodyErr != nil {
-			break
-		}
 	}
-	_ = reader.CloseWithError(bodyErr)
-	_ = writer.Close()
-bodyDone:
-	if bodyErr != nil {
+	result := make(chan upstreamResult, 1)
+	go func() {
+		response, err := client.Do(request)
+		result <- upstreamResult{response, err}
+	}()
+	if err := receiveRequestBody(stream, start, writer); err != nil {
 		cancel()
-		_ = reader.CloseWithError(bodyErr)
-		_ = writer.CloseWithError(bodyErr)
-		if encoder != nil {
-			_ = encoder.Close()
-		}
+		_ = reader.CloseWithError(err)
+		_ = writer.CloseWithError(err)
 		go func() {
 			completed := <-result
 			if completed.response != nil {
 				_ = completed.response.Body.Close()
 			}
 		}()
-		return sendForwardError(stream, "REQUEST_BODY_ERROR", bodyErr.Error(), true)
+		return sendForwardError(stream, "REQUEST_BODY_ERROR", err.Error(), true)
 	}
+	_ = writer.Close()
 	completed := <-result
 	if completed.err != nil {
 		if completed.response != nil {
@@ -322,7 +373,10 @@ bodyDone:
 		}
 		return sendForwardError(stream, "UPSTREAM_ERROR", completed.err.Error(), true)
 	}
-	response := completed.response
+	return sendResponse(stream, completed.response)
+}
+
+func sendResponse(stream pluginv1.TransportPlugin_ForwardServer, response *http.Response) error {
 	defer response.Body.Close()
 	headers := make(map[string]*pluginv1.HeaderValues, len(response.Header))
 	for key, values := range response.Header {
