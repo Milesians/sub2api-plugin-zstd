@@ -8,6 +8,7 @@
 cd testenv
 cp .env.example .env
 sed -i "s/replace-with-a-test-password/$(openssl rand -hex 16)/" .env
+sed -i "s/replace-with-a-test-admin-password/$(openssl rand -hex 16)/" .env
 sed -i "s/replace-with-another-openssl-rand-hex-32/$(openssl rand -hex 32)/" .env
 sed -i "s/replace-with-openssl-rand-hex-32/$(openssl rand -hex 32)/" .env
 docker compose up -d
